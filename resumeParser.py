@@ -6,87 +6,118 @@ from dotenv import load_dotenv
 import json
 import os
 import re
+from datetime import datetime
 
 # ---------- Setup Gemini ----------
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 gemini.configure(api_key=api_key)
 
+
 # ---------- STEP 1: Extract text ----------
-def extract_text_from_pdf(path): 
+def extract_text_from_pdf(path):
     doc = fitz.open(path)
     text = ""
-    for page in doc: 
+    for page in doc:
         text += page.get_text("text") + "\n"
     return text
+
 
 def extract_text_from_img(path):
     img = Image.open(path)
     return pytesseract.image_to_string(img)
 
+
 # ---------- STEP 2: Use LLM to Extract info ----------
 def extract_with_gemini(text):
     prompt = f'''
-You are a strict resume parser. Extract ONLY information explicitly written in the resume text. 
-Do not infer, generate, or add any content that is not present in the resume. 
-If a field is missing, leave it empty ("" for strings, [] for lists, 0.0 for numbers).
+You are a STRICT resume parser.
+Your job is to extract ONLY information that is explicitly written in the resume text. 
+Do NOT infer, guess, or add any information that is not present.
 
-Return a valid JSON with exactly these keys (no extra keys, no missing keys):
+Return a valid JSON with EXACTLY these keys (no extra keys, no missing keys):
 
 {{
   "name": "",
   "summary": "",
   "education": [
-    {{"degree": "", "school": "", "gpa": ""}}
+    {{"degree": "", "school": "", "gpa": "", "year": ""}}
   ],
   "experiences": [
     {{
       "role": "",
+      "organization": "",
+      "start_date": "",
+      "end_date": "",
       "years": 0.0,
-      "highlights": [],
-      "tech_stack": []
+      "location": "",
+      "highlights": []
     }}
   ],
   "projects": [
     {{
       "role": "",
-      "tech_stack": [],
       "highlights": []
     }}
   ],
   "skills": [],
-  "languages": []
+  "languages": [],
+  "certifications": [
+    {{"name": "", "issuer": "", "year": ""}}
+  ],
+  "awards": [
+    {{"title": "", "issuer": "", "year": ""}}
+  ],
+  "activities": [
+    {{
+      "role": "",
+      "organization": "",
+      "start_date": "",
+      "end_date": "",
+      "years": 0.0,
+      "highlights": []
+    }}
+  ],
+  "publications": [
+    {{"title": "", "journal": "", "year": "", "doi": ""}}
+  ],
+  "licenses": [
+    {{"name": "", "issuer": "", "year": ""}}
+  ]
 }}
 
-General normalization rules:
-- All extracted text must be in English. Translate if needed. Do not leave any non-English words.
-- Output must be strictly valid JSON.
-- Always include all keys. If missing: "" for strings, [] for lists, 0.0 for numbers.
-- "summary": only fill if resume explicitly contains it. Otherwise "".
-- "education.degree": only major/field of study (e.g. "Computer Science"). Do not include faculty/department/school names.
-- "education.school": only the university/college/school name.
-- "skills" and "tech_stack": 
-  * unique arrays, no duplicates
-  * remove vague terms like "API", "Cloud Services" unless explicitly named in resume
-  * normalize names to most common English form with correct casing (JavaScript, Node.js, React.js, PostgreSQL)
-- "experiences[].years": numeric float. If not found use 0.0.
-- "experiences": only for real work (internships, part-time, full-time jobs). 
-- "projects": only for academic, personal, coursework, research. 
-- If no work experience: keep "experiences" as array with one empty object. 
-- Never put project info in "experiences".
-- "highlights": extract exactly as written, translate to English if needed. Do not invent or expand.
-- "languages": 
-  * normalize to CEFR (English) or keep JLPT/HSK/TOPIK levels
-  * if only descriptors like Fluent, Intermediate, Basic → keep as is
-  * always format "Language - Level" (e.g. "English - C1")
-- Remove redundant or repeated information across all fields.
+Strict rules you MUST follow:
+1. Output must be strictly valid JSON. No extra commentary, no markdown code fences.
+2. Always include ALL keys, even if empty.
+   - "" for strings
+   - [] for arrays
+   - 0.0 for numbers
+3. "summary": only fill if explicitly written. Otherwise "".
+4. "education.degree": only major/field of study (e.g. "Computer Science").
+5. "education.school": only the university/college/school name.
+6. "education.year": extract graduation year or study period if available. Otherwise "".
+7. "education.gpa": must match pattern like "3.5/4.0". If invalid, leave "".
+8. "experiences": only for real work (internship, part-time, full-time).
+   - "role": job title
+   - "organization": company/organization
+   - "start_date": extract as YYYY-MM or YYYY if available
+   - "end_date": extract as YYYY-MM, YYYY or "Present"
+   - "years": numeric float (will be validated again in code)
+   - "location": location if available
+   - "highlights": bullet points or short action statements only
+9. "projects": only academic/personal/research projects. Never mix with experiences.
+10. "skills" and "languages":
+    - Arrays, unique, no duplicates
+    - Normalize casing (JavaScript, Node.js, PostgreSQL…)
+11. "languages": format "English - C1" if level available, else keep descriptor.
+12. "certifications", "awards", "activities", "publications", "licenses": extract if present.
+13. Remove duplicates across fields.
+14. All extracted text must be in English.
 
 Resume text:
 {text}
 '''
     model = gemini.GenerativeModel("gemini-2.5-flash")
-
-
     response = model.generate_content(prompt)
 
     raw_output = ""
@@ -104,10 +135,85 @@ Resume text:
         return json.loads(raw_output)
     except Exception as e:
         print("JSON parse error:", e)
-        print("Raw output:", raw_output[:300]) 
+        print("Raw output:", raw_output[:300])
         return {}
 
-# ---------- STEP 3: Validate ----------
+
+# ---------- STEP 3a: Filter highlights ----------
+def filter_highlights(raw_list):
+    filtered = []
+    action_verbs = [
+        "developed", "designed", "implemented", "led", "analyzed",
+        "created", "managed", "optimized", "conducted", "built",
+        "researched", "improved", "organized", "presented", "trained"
+    ]
+    for item in raw_list:
+        text = str(item).strip("•- \n\t").strip()
+        if not text:
+            continue
+        if len(text.split()) < 3:
+            continue
+        if text.split()[0].lower() in action_verbs:
+            filtered.append(text)
+        else:
+            filtered.append(text)
+    return list(dict.fromkeys(filtered))
+
+
+# ---------- STEP 3b: Refine highlights ----------
+def refine_highlights(highlights, max_words=18):
+    refined = []
+    for hl in highlights:
+        text = str(hl).strip("•- \n\t").strip()
+        if not text:
+            continue
+        words = text.split()
+        if len(words) > max_words:
+            parts = re.split(r',| and ', text)
+            parts = [p.strip() for p in parts if len(p.strip().split()) >= 3]
+            for p in parts:
+                refined.append(p)
+        else:
+            refined.append(text)
+    normalized = []
+    for item in refined:
+        item = item.strip()
+        if not item:
+            continue
+        item = item[0].upper() + item[1:] if item else item
+        if not item.endswith('.'):
+            item += '.'
+        normalized.append(item)
+    unique = list(dict.fromkeys(normalized))
+    return unique
+
+
+# ---------- STEP 3c: Compute years ----------
+def compute_years(start_date: str, end_date: str) -> float:
+    if not start_date:
+        return 0.0
+
+    def parse_date(d):
+        if not d: return None
+        d = d.strip().lower()
+        if d in ["present", "hiện tại", "current", "now"]:
+            return datetime.today()
+        for fmt in ("%Y-%m", "%Y"):
+            try:
+                return datetime.strptime(d, fmt)
+            except:
+                continue
+        return None
+
+    start = parse_date(start_date)
+    end = parse_date(end_date) or datetime.today()
+    if not start: return 0.0
+
+    diff_years = (end.year - start.year) + (end.month - start.month) / 12
+    return round(diff_years, 2)
+
+
+# ---------- STEP 4: Validate JSON ----------
 def validate_json(data):
     if not isinstance(data, dict):
         return {}
@@ -115,85 +221,115 @@ def validate_json(data):
     schema = {
         "name": "",
         "summary": "",
-        "education": [
-            {"degree": "", "gpa": ""}
-        ],
-        "experiences": [
-            {"role": "", "years": 0.0, "highlights": [], "tech_stack": []}
-        ],
-        "projects": [
-            {"role": "", "tech_stack": [], "highlights": []}
-        ],
+        "education": [{"degree": "", "school": "", "gpa": "", "year": ""}],
+        "experiences": [{"role": "", "organization": "", "years": 0.0, "location": "", "highlights": []}],
+        "projects": [{"role": "", "highlights": []}],
         "skills": [],
-        "languages": []
+        "languages": [],
+        "certifications": [{"name": "", "issuer": "", "year": ""}],
+        "awards": [{"title": "", "issuer": "", "year": ""}],
+        "activities": [{"role": "", "organization": "", "years": 0.0, "highlights": []}],
+        "publications": [{"title": "", "journal": "", "year": "", "doi": ""}],
+        "licenses": [{"name": "", "issuer": "", "year": ""}]
     }
 
     clean_data = {k: data.get(k, v) for k, v in schema.items()}
 
-    # --- Chuẩn hoá education ---
+    # --- normalize education ---
     fixed_edu = []
     for edu in clean_data.get("education", []):
         if isinstance(edu, dict):
-            fixed = {"degree": edu.get("degree", ""), "gpa": edu.get("gpa", "")}
+            fixed = {
+                "degree": edu.get("degree", ""),
+                "school": edu.get("school", ""),
+                "gpa": edu.get("gpa", ""),
+                "year": edu.get("year", "")
+            }
             if fixed["gpa"] and not re.match(r"^\d+(\.\d+)?(/\d+(\.\d+)?)?$", str(fixed["gpa"])):
                 fixed["gpa"] = ""
             fixed_edu.append(fixed)
     clean_data["education"] = fixed_edu if fixed_edu else schema["education"]
 
-    # --- Chuẩn hoá experiences ---
+    # --- normalize experiences ---
     fixed_exps = []
-    for exp in clean_data.get("experiences", []):
+    for exp in data.get("experiences", []):
         if isinstance(exp, dict):
+            years_val = compute_years(exp.get("start_date", ""), exp.get("end_date", ""))
             fixed = {
                 "role": exp.get("role", ""),
-                "years": float(exp.get("years", 0.0)) if str(exp.get("years", "")).replace(".","",1).isdigit() else 0.0,
-                "highlights": exp.get("highlights", []) if isinstance(exp.get("highlights", []), list) else [],
-                "tech_stack": exp.get("tech_stack", []) if isinstance(exp.get("tech_stack", []), list) else []
+                "organization": exp.get("organization", ""),
+                "years": years_val,
+                "location": exp.get("location", ""),
+                "highlights": refine_highlights(filter_highlights(exp.get("highlights", [])))
             }
-            fixed_exps.append(fixed)
-    clean_data["experiences"] = fixed_exps if fixed_exps else schema["experiences"]
+            if fixed["role"] or fixed["organization"] or fixed["highlights"]:
+                fixed_exps.append(fixed)
+    clean_data["experiences"] = fixed_exps if fixed_exps else []
 
-    # --- Chuẩn hoá projects ---
+    # --- normalize projects ---
     fixed_projs = []
-    for proj in clean_data.get("projects", []):
+    for proj in data.get("projects", []):
         if isinstance(proj, dict):
             fixed = {
                 "role": proj.get("role", ""),
-                "tech_stack": proj.get("tech_stack", []) if isinstance(proj.get("tech_stack", []), list) else [],
-                "highlights": proj.get("highlights", []) if isinstance(proj.get("highlights", []), list) else []
+                "highlights": refine_highlights(filter_highlights(proj.get("highlights", [])))
             }
-            fixed_projs.append(fixed)
-    clean_data["projects"] = fixed_projs if fixed_projs else schema["projects"]
+            if fixed["role"] or fixed["highlights"]:
+                fixed_projs.append(fixed)
+    clean_data["projects"] = fixed_projs if fixed_projs else []
 
-    # --- Chuẩn hoá skills ---
-    skills = clean_data.get("skills", [])
-    if isinstance(skills, str):
-        clean_data["skills"] = [s.strip() for s in skills.split(",") if s.strip()]
-    elif isinstance(skills, list):
-        clean_data["skills"] = [str(s).strip() for s in skills if str(s).strip()]
-    else:
-        clean_data["skills"] = []
+    # --- normalize activities ---
+    fixed_acts = []
+    for act in data.get("activities", []):
+        if isinstance(act, dict):
+            years_val = compute_years(act.get("start_date", ""), act.get("end_date", ""))
+            fixed = {
+                "role": act.get("role", ""),
+                "organization": act.get("organization", ""),
+                "years": years_val,
+                "highlights": refine_highlights(filter_highlights(act.get("highlights", [])))
+            }
+            if fixed["role"] or fixed["organization"] or fixed["highlights"]:
+                fixed_acts.append(fixed)
+    clean_data["activities"] = fixed_acts if fixed_acts else []
 
-    # --- Chuẩn hoá languages ---
-    languages = clean_data.get("languages", [])
-    if not isinstance(languages, list):
-        languages = []
-    clean_data["languages"] = [str(l).strip() for l in languages if str(l).strip()]
+    # --- normalize skills & languages ---
+    for key in ["skills", "languages"]:
+        val = clean_data.get(key, [])
+        if isinstance(val, str):
+            clean_data[key] = [s.strip() for s in val.split(",") if s.strip()]
+        elif isinstance(val, list):
+            clean_data[key] = [str(s).strip() for s in val if str(s).strip()]
+        else:
+            clean_data[key] = []
 
     return clean_data
 
+
 # ---------- Wrapper ----------
-def parse_resume(file_path, is_pdf=True):
-    raw_text = extract_text_from_pdf(file_path) if is_pdf else extract_text_from_img(file_path)
+def parse_resume(file_path: str):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        raw_text = extract_text_from_pdf(file_path)
+    elif ext in [".png", ".jpg", ".jpeg"]:
+        raw_text = extract_text_from_img(file_path)
+    else:
+        raise ValueError(f"Unsupported file format: {ext}")
+
     llm_data = extract_with_gemini(raw_text)
     final_data = validate_json(llm_data)
     return final_data
 
+
 # ---------- Run ----------
 if __name__ == "__main__":
-    pdf_file = "public/resume.pdf"
-    if not os.path.exists(pdf_file):
-        print("❌ File not found:", pdf_file)
+    file_path = "public/resume.pdf"
+    
+    if not os.path.exists(file_path):
+        print("❌ File not found:", file_path)
     else:
-        result = parse_resume(pdf_file, is_pdf=True)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        try:
+            result = parse_resume(file_path)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except ValueError as e:
+            print("❌", e)
