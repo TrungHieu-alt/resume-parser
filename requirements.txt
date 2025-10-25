@@ -3,3 +3,6 @@ pymupdf
 pytesseract
 Pillow
 python-dotenv
+openai
+llama-index
+Mastodon.py
